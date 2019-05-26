@@ -1,0 +1,366 @@
+libname proj 'E:/ARP';
+
+data proj.pizzag;
+infile "H:\fzpizza\fzpizza_groc_1114_1165" firstobs=2 ;
+input IRI_KEY WEEK SY GE VEND ITEM UNITS DOLLARS F $ D PR;
+datalines;
+run;
+
+proc import out=proj.brand datafile="h:\prod_fpizza.xls" dbms=EXCEL REPLACE;
+getnames=YES; mixed=YES; scantext=YES; run;
+
+data proj.pizzag1;
+  set proj.pizzag;
+  length upc $17;
+  upc=put(sy,z2.)||'-'||put(ge,z2.)||'-'||put(vend,z5.)||'-'||put(item,z5.);
+run;
+
+PROC SQL; CREATE TABLE proj.PIZZAJOIN AS SELECT P.IRI_KEY,B.L3,B.L4,B.L5,B.L9,B.Level,P.UPC,
+B.VOL_EQ,P.WEEK,P.UNITS,P.DOLLARS,P.F,P.D,P.PR
+FROM PIZZAG1 P, proj.BRAND B WHERE B.UPC=P.UPC; quit;
+
+/* Filtering out Tombstone products */
+proc SQL;
+create table proj.tombstone as select *
+from proj.pizzajoin
+where L5 LIKE '%TOMB%';
+/* Creating a balanced panel with stores that have data for the same number of weeks */
+proc sql;
+create table proj.tombstone_bp as
+select iri_key,count(distinct WEEK) AS distinct_weeks from proj.tombstone
+group by iri_key
+having distinct_weeks=52;
+QUIT;
+proc sql;
+create table proj.tombfinal as select * from proj.tombstone
+where iri_key in (select iri_key from proj.tombstone_bp); quit;
+/* Calculating total units sold and price per unit */
+data proj.tombfinal; set proj.tombfinal;
+tot_vol=vol_eq*units;
+ppu=dollars/tot_vol; run;
+proc univariate data=proj.tombfinal; var ppu; run;
+proc sql;
+create table proj.tombstone_calc as select iri_key,week,units,tot_vol,dollars,f,d,pr,upc,ppu
+from proj.tombfinal; quit;
+proc freq data=proj.tombstone_calc; table f; run;
+proc freq data=proj.tombstone_calc; table d; run;
+proc freq data=proj.tombstone_calc; table pr; run;
+data proj.tombstone_calc; set tombstone_calc; 
+if f='NONE' then f1=0; else f1=1;
+if d='0' then d1=0; else d1=1;
+if pr='0' then pr1=0; else pr1=1; run;
+/* Creating grouped dataset at Store,Week,UPC level */
+proc sql;
+create table proj.ts_grouped as select iri_key,week,upc,sum(units) as tot_units,sum(tot_vol) as sum_vol,sum(dollars) as tot_dollars,
+sum(f1) as tot_f1, sum(d1) as tot_d1,sum(pr1) as tot_pr1, avg(ppu) as avg_ppu
+from proj.tombstone_calc
+group by iri_key,week,upc; quit;
+/* Exporting grouped dataset */
+proc export data=proj.ts_grouped
+outfileE="E:\ARP\TS_GROUPED.CSV" dbms=CSV; run;
+/* Creating weighted price, feature, display and price reduction variables for panel regression */
+proc sql;
+create table proj.ts_weekly as
+select iri_key,week,sum(units) as tot_iri_week_units, sum(tot_vol) as tot_iri_week_vol
+from tombstone_calc
+group by iri_key,week; quit;
+PROC SQL;
+CREATE TABLE proj.ts_grouped1 AS
+SELECT A.*, B.* FROM 
+(SELECT * FROM proj.ts_grouped) AS A
+LEFT JOIN
+(SELECT * FROM proj.ts_weekly) AS B
+ON A.IRI_KEY=B.IRI_KEY AND A.WEEK=B.WEEK;
+QUIT;
+DATA proj.ts_grouped1;
+SET proj.ts_grouped1;
+IF tot_f1=0 THEN w_feature=0;
+ELSE w_feature=1*(sum_vol/tot_iri_week_vol);
+IF tot_d1=0 THEN W_DISPLAY=0;
+ELSE w_display=1*(sum_vol/tot_iri_week_vol);
+IF tot_pr1=0 THEN W_PROMOTION=0;
+ELSE W_PROMOTION=1*(sum_vol/tot_iri_week_vol);
+RUN;
+/* Creating final panel dataset for regression */
+proc sql;
+create table proj.ts_final as
+select iri_key,week,sum(tot_units) as sum_units,sum(sum_vol) as sum_tot_vol,sum(tot_dollars) as sum_dollars,avg(avg_ppu) as avg_price,
+sum(w_feature) as sum_w_feature,sum(w_display) as sum_w_display,sum(w_promotion) as sum_w_promotion 
+from proj.ts_grouped1
+group by iri_key,week; quit;
+
+/*proc univariate data=proj.ts_final; var avg_price; run;*/
+
+/*Check for Non-Linearity*/
+proc sgplot data=proj.ts_final; scatter x=avg_price y=sum_dollars; run;
+
+/*MULTICOLLINEARITY*/
+PROC CORR DATA=proj.ts_final;
+RUN;
+
+
+PROC PANEL DATA = proj.ts_final;
+ID IRI_KEY WEEK;       
+MODEL sum_units = sum_w_feature sum_w_display sum_w_promotion /FIXTWO RANTWO;    
+RUN;
+
+/*Interaction Effect*/
+data proj.ts_final2;
+set proj.ts_final;
+WT_PRICESQ = sum_dollars * sum_dollars;
+INF_D =  sum_w_feature * sum_w_display;
+INF_P =  sum_w_feature * sum_w_promotion;
+IND_P = sum_w_display * sum_w_promotion;
+INF_D_P = sum_w_display *  sum_w_feature * sum_w_promotion;
+RUN;
+
+
+PROC PANEL DATA = proj.ts_final2;
+ID IRI_KEY WEEK;       
+MODEL sum_units = sum_w_feature sum_w_display sum_w_promotion INF_D INF_P IND_P INF_D_P /FIXTWO RANTWO;    
+RUN;
+
+/************************************* RFM ANALYSIS *******************************************/
+
+data proj.store;
+infile "h:\Delivery_Stores.txt" firstobs=2 ;
+input IRI_KEY OU $ EST_ACV Market_Name $20-45 Open Clsd MskdName $;
+datalines;
+run;
+
+proc import out=proj.paneldata datafile="h:\paneldata.txt" REPLACE;
+getnames=YES; run;
+
+DATA proj.paneldata2;
+SET proj.paneldata;
+UPC=put(COLUPC,z13.);
+run;
+
+data proj.brand2;
+  set proj.brand;
+  upc2=put(sy,z2.)||put(ge,z1.)||put(vend,z5.)||put(item,z5.);
+run;
+
+proc SQL;
+create table proj.rfm1 as select *
+from proj.paneldata2 A LEFT JOIN
+proj.brand2 B on A.upc=B.upc2
+where L5 LIKE '%TOMB%';
+
+/*Customers who spend more money frequently in less time are more likely to buy again. 
+Customers with High RFM scores should be a signal to learn more from the customer rather than trying to sell again
+You can also understand how much of our revenue comes from repeat customers and new customers..*/
+
+proc import out=proj.week_trans datafile="h:\IRI week translation.xls" dbms=EXCEL REPLACE;
+getnames=YES; mixed=YES; scantext=YES; run;
+
+PROC SQL;
+CREATE TABLE proj.PANEL_FINAL AS
+SELECT * FROM
+(SELECT * FROM proj.rfm1) AS A 
+inner JOIN
+(SELECT * FROM proj.week_trans) AS B
+ON A.WEEK=B.iri_week;
+
+DATA proj.PANEL_FINAL;
+SET proj.PANEL_FINAL;
+LAST_WEEK='30DEC2001'D;
+FORMAT LAST_WEEK DDMMYY10.;
+run;
+
+PROC SQL;
+CREATE TABLE PROJ.RFM_FINAL AS
+SELECT PANID, SUM(DOLLARS) AS MONETARY,COUNT(WEEK) AS FREQUENCY,MAX(WEEK) AS LAST_PURCHASE,
+MIN(1165-WEEK) AS RECENCY
+FROM PROJ.PANEL_FINAL
+GROUP BY PANID
+HAVING FREQUENCY>1;
+QUIT;
+
+/** Monetary and Frequqency have very high correlation so we can use any one*/
+PROC CORR DATA=PROJ.RFM_FINAL;
+VAR MONETARY FREQUENCY RECENCY;
+RUN;
+
+PROC MEANS DATA=PROJ.RFM_FINAL MIN P20 P40 P60 P80 MAX;
+VAR MONETARY RECENCY;
+OUTPUT OUT=proj.CUST_PERCENTILE MIN= P20= P40= P60= P80= MAX=/ AUTONAME;
+RUN;
+
+
+/*CREATING CUSTOMER SEGMENTS*/
+DATA PROJ.RFM_FINAL;
+SET PROJ.RFM_FINAL;
+ID=1;
+
+DATA proj.CUST_PERCENTILE;
+SET proj.CUST_PERCENTILE;
+ID = 1;
+RUN;
+
+PROC SQL;
+CREATE TABLE PROJ.PANEL_WITH_SEGMENTS AS
+SELECT * FROM
+(SELECT * FROM PROJ.RFM_FINAL) AS A 
+LEFT JOIN
+(SELECT * FROM proj.CUST_PERCENTILE) AS B
+ON A.ID=B.ID;
+
+
+DATA PROJ.PANEL_WITH_SEGMENTS (KEEP=PANID MONETARY FREQUENCY RECENCY SEGMENT );
+SET PROJ.PANEL_WITH_SEGMENTS;
+IF (MONETARY > MONETARY_P80) THEN SEGMENT=1;
+ELSE IF (MONETARY > MONETARY_P60 & RECENCY > RECENCY_P80) THEN SEGMENT=2;
+ELSE SEGMENT=0;
+RUN;
+
+------------------------/*USING DEMOGRAPHICS DATA TO UNDERSTAND THE TOP 20% OF OUR CUSTOMERS*/------
+
+
+PROC IMPORT DATAFILE='H:\ads demo1.csv'
+OUT=proj.d1
+DBMS=CSV
+REPLACE;
+GETNAMES=YES;
+DELIMITER=",";
+RUN;
+
+
+DATA proj.d2 (KEEP = PANID PAN_TYPE INCOME Family_Size RESIDENT_TYPE AGE_MALE EDUC_MALE OCC_MALE MALE_WORK_HR AGE_FEMALE EDUC_FEMALE 
+OCC_FEMALE FEMALE_WORK_HR NUM_DOGS NUM_CATS CHILD_AGE MARITAL_STATUS);
+SET proj.d1(RENAME = (Panelist_ID = PANID Combined_Pre_Tax_Income_of_HH = INCOME Family_Size = Family_Size 
+Type_of_Residential_Possession = RESIDENT_TYPE Age_Group_Applied_to_Male_HH	= AGE_MALE Education_Level_Reached_by_Male = EDUC_MALE 
+Occupation_Code_of_Male_HH = OCC_MALE Male_Working_Hour_Code = MALE_WORK_HR Age_Group_Applied_to_Female_HH = AGE_FEMALE 
+Education_Level_Reached_by_Femal = EDUC_FEMALE Occupation_Code_of_Female_HH = OCC_FEMALE Female_Working_Hour_Code = FEMALE_WORK_HR 
+Number_of_Dogs = NUM_DOGS Number_of_Cats = NUM_CATS Children_Group_Code = CHILD_AGE Marital_Status = MARITAL_STATUS));
+RUN;
+
+
+PROC SQL;
+CREATE TABLE proj.d3 AS
+SELECT * FROM proj.d2 WHERE Family_Size <> 0 AND RESIDENT_TYPE <> 0 AND AGE_MALE <> 7 AND AGE_MALE <> 0 AND EDUC_MALE <> 9 AND EDUC_MALE <> 0 AND OCC_MALE <> 11 AND MALE_WORK_HR <> 7 AND 
+AGE_FEMALE <> 7 AND AGE_FEMALE <> 0 AND EDUC_FEMALE <> 9 AND EDUC_FEMALE <> 0 AND OCC_FEMALE <> 11 AND FEMALE_WORK_HR <> 7 AND MARITAL_STATUS <> 0 AND CHILD_AGE <> 0 ;
+QUIT;
+
+
+DATA PROJ.D4;
+SET PROJ.D3;
+PETS_TOTAL=NUM_CATS+NUM_DOGS;RUN;
+
+DATA PROJ.D5;
+SET PROJ.D4;
+IF Family_Size in (4,5,6)THEN FAM_SIZE_L=1 ; ELSE FAM_SIZE_L=0;
+IF Family_Size in (1,2,3) THEN FAM_SIZE_R=1 ; ELSE FAM_SIZE_R=0;
+
+IF INCOME IN (1,2,3,4) THEN FAM_INCOME_L=1 ; ELSE FAM_INCOME_L=0;
+IF INCOME IN (5,6,7,8) THEN FAM_INCOME_M=1 ; ELSE FAM_INCOME_M=0;
+IF INCOME IN (9,10,11,12) THEN FAM_INCOME_H=1 ; ELSE FAM_INCOME_H=0;
+
+IF AGE_MALE IN (1) THEN AGE_MY=1 ; ELSE AGE_MY=0;
+IF AGE_MALE IN (2,3,4) THEN AGE_MM=1 ; ELSE AGE_MM=0;
+IF AGE_MALE IN (5,6) THEN AGE_ME=1 ; ELSE AGE_ME=0;
+
+IF AGE_FEMALE IN (1) THEN AGE_FY=1 ; ELSE AGE_FY=0;
+IF AGE_FEMALE IN (2,3,4) THEN AGE_FM=1 ; ELSE AGE_FM=0;
+IF AGE_FEMALE IN (5,6) THEN AGE_FE=1 ; ELSE AGE_FE=0;
+
+IF EDUC_MALE IN (1,2,3) THEN EDUC_MS=1 ; ELSE EDUC_MS=0;
+IF EDUC_MALE IN (4,5,6) THEN EDUC_MC=1 ; ELSE EDUC_MC=0;
+IF EDUC_MALE IN (7,8) THEN EDUC_MG=1 ; ELSE EDUC_MG=0;
+
+IF EDUC_FEMALE IN (1,2,3) THEN EDUC_FS=1 ; ELSE EDUC_FS=0;
+IF EDUC_FEMALE IN (4,5,6) THEN EDUC_FC=1 ; ELSE EDUC_FC=0;
+IF EDUC_FEMALE IN (7,8) THEN EDUC_FG=1 ; ELSE EDUC_FG=0;
+
+IF OCC_MALE IN (1,2,3)  THEN OCC_MWH=1; ELSE OCC_MWH=0;
+IF OCC_MALE IN (4,5)  THEN OCC_MWL=1; ELSE OCC_MWL=0;
+IF OCC_MALE IN (6,7,8,9) THEN OCC_MB=1; ELSE OCC_MB=0;
+IF OCC_MALE IN (10,13) THEN OCC_MNO=1; ELSE OCC_MNO=0;
+
+IF OCC_FEMALE IN (1,2,3) THEN OCC_FWH=1; ELSE OCC_FWH=0;
+IF OCC_FEMALE IN (4,5) THEN OCC_FWL=1; ELSE OCC_FWL=0;
+IF OCC_FEMALE IN (6,7,8,9) THEN OCC_FB=1; ELSE OCC_FB=0;
+IF OCC_FEMALE IN (10,13) THEN OCC_FNO=1; ELSE OCC_FNO=0;
+
+
+IF CHILD_AGE IN (1,2,3) THEN CHILD_1=1; ELSE CHILD_1=0;
+IF CHILD_AGE IN (4,5,6) THEN CHILD_2=1; ELSE CHILD_2=0;
+IF CHILD_AGE IN (7) THEN CHILD_3=1; ELSE CHILD_3=0;
+IF CHILD_AGE IN (8) THEN CHILD_0=1; ELSE CHILD_0=0;
+
+IF PETS_TOTAL=0 THEN PETS=1; ELSE PETS=0;
+
+RUN;
+
+
+DATA PROJ.D6 (DROP = INCOME Family_Size RESIDENT_TYPE AGE_MALE EDUC_MALE OCC_MALE MALE_WORK_HR AGE_FEMALE EDUC_FEMALE OCC_FEMALE FEMALE_WORK_HR CHILD_AGE MARITAL_STATUS PETS_TOTAL NUM_DOGS NUM_CATS);
+SET PROJ.D5;
+RUN;
+
+PROC SQL;
+CREATE TABLE PROJ.DFINAL AS
+SELECT * FROM
+(SELECT * FROM PROJ.PANEL_WITH_SEGMENTS) AS A 
+INNER JOIN
+(SELECT * FROM PROJ.D6) AS B
+ON A.PANID=B.PANID
+WHERE A.SEGMENT=1;
+QUIT;
+
+PROC MEANS DATA=PROJ.DFINAL;RUN;
+
+-----------------LOGISTIC REGRESSION----
+
+
+proc SQL;
+create table proj.lr as select *
+from proj.paneldata2 A LEFT JOIN
+proj.brand2 B on A.upc=B.upc2;
+
+proc sql;
+create table proj.lrdata as select *
+from proj.lr A left join
+proj.d3 B on A.PANID=B.PANID;
+
+DATA proj.lrdata1 (KEEP = L5 INCOME Family_Size CHILD_AGE);
+set proj.lrdata;
+run;
+
+
+DATA PROJ.lrdata2;
+SET PROJ.lrdata1;
+IF L5 =: "TOMB" THEN DECISION = 1; 
+ELSE IF L5 =: "DI GIORNO" THEN DECISION=2;
+ELSE IF L5 =: "RED BARON" THEN DECISION =3;
+RUN;
+
+DATA PROJ.LRDATA3;
+SET proj.LRDATA2;
+IF DECISION = "." then delete;
+if income = "." then delete;
+run;
+
+DATA PROJ.lrdata4;
+SET PROJ.lrdata3;
+IF Family_Size in (4,5,6)THEN FAM_SIZE=2 ; ELSE FAM_SIZE=1;
+
+IF INCOME IN (1,2,3,4) THEN FAM_INCOME=1;
+IF INCOME IN (5,6,7,8) THEN FAM_INCOME=2 ;
+IF INCOME IN (9,10,11,12) THEN FAM_INCOME=3;
+
+IF CHILD_AGE IN (1,2,3) THEN CHILDCOUNT=1;
+IF CHILD_AGE IN (4,5,6) THEN CHILDCOUNT=2;
+IF CHILD_AGE IN (7) THEN CHILDCOUNT=3;
+IF CHILD_AGE IN (8) THEN CHILDCOUNT=0;
+
+RUN;
+
+proc logistic data = PROJ.LRDATA4;
+class DECISION (ref = "1") / param = ref;
+model DECISION = FAM_INCOME CHILDCOUNT FAM_SIZE / link = glogit;
+run;
+
+
+
+
+
